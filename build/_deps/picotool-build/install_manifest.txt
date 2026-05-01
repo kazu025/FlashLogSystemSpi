@@ -1,0 +1,7 @@
+/home/kazu/mint/GitHubUp/018-FlashLogStorageRing/build/_deps/picotool/picotool
+/home/kazu/mint/GitHubUp/018-FlashLogStorageRing/build/_deps/picotool/picotoolTargets.cmake
+/home/kazu/mint/GitHubUp/018-FlashLogStorageRing/build/_deps/picotool/picotoolTargets-release.cmake
+/home/kazu/mint/GitHubUp/018-FlashLogStorageRing/build/_deps/picotool/picotoolConfig.cmake
+/home/kazu/mint/GitHubUp/018-FlashLogStorageRing/build/_deps/picotool/picotoolConfigVersion.cmake
+/home/kazu/mint/GitHubUp/018-FlashLogStorageRing/build/_deps/picotool/enc_bootloader.elf
+/home/kazu/mint/GitHubUp/018-FlashLogStorageRing/build/_deps/picotool/enc_bootloader_mbedtls.elf

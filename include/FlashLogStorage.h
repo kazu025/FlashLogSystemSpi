@@ -6,6 +6,7 @@
 
 #include "FlashDriver.h"
 #include "LogProtocol.h"
+#include "UartDma.h"
 
 class FlashLogStorage{
 public:
@@ -28,7 +29,9 @@ public:
     bool findOldestFrame(uint32_t* out_addr);
     bool findNewestFrame(uint32_t* out_addr, uint32_t* out_seq);
     bool dumpFramesOldestFirst();
-
+    bool readFrame(uint32_t addr, uint8_t* out, size_t out_size, size_t* out_len);
+    bool readFramesOldestFirstTest();
+    bool sendFramesOldestFirst(UartDma& uart);
     uint32_t getWriteAddress() const;
     uint32_t getOldestAddress() const; //
     uint32_t getNewestAddress() const; //

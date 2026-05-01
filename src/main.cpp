@@ -99,6 +99,10 @@ static void app_task(void *arg){
     if(!test_flash_storage_dump_oldest_first(*g_log_storage)){
         printf("!!! test_flash_storage_dump_oldest_first failed\n");
     }
+    g_log_storage->dumpFramesOldestFirst();
+    g_log_storage->readFramesOldestFirstTest();
+    printf("send flash logs to Uart...\n");
+    g_log_storage->sendFramesOldestFirst(*g_uart_dma);
     while(true){
         led_sw();
         vTaskDelay(pdMS_TO_TICKS(1000));

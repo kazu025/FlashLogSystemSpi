@@ -73,7 +73,7 @@ bool FlashLogStorage::append(const uint8_t* data, size_t len){
 
     // 1フレームがセクターを跨ぐ場合は
     if(len > FlashDriver::SECTOR_SIZE){
-        printf("!!! %s:append too large len=%u\n", __func__);
+        printf("!!! %s:append too large len=%u\n", __func__, static_cast<unsigned>(len));
         return false;
     }
 
@@ -86,10 +86,10 @@ bool FlashLogStorage::append(const uint8_t* data, size_t len){
         addr = wrapAddress(addr);
     }
 
-/*      sector先頭から書く場合は、そのsectorを丸ごとerase。
-        ここで古いログが消えるが、後でrebuildIndexFromFlash()して
-        oldest/newest/write_addrを再構築する。*/
+/*      sector先頭から書く場合は、そのsectorを丸ごとeraseする。
+        eraseの前に、そのsector内の既存フレームをindexから除外する*/
     if(isSectorStart(addr)){
+        invalidateFramesInErasedSector(addr);
         if(!flash_.sectorErase(addr)){
             printf("!!! %s:sectorErase failed addr=0x%08X\n", __func__, addr);
             return false;
@@ -150,25 +150,25 @@ bool FlashLogStorage::rebuildIndexFromFlash(){
 
     uint32_t addr = config_.start_addr;
     bool found = false;
-    uint32_t oldest_seq = 0;
-    uint32_t oldest_addr = config_.start_addr;
-
     uint32_t newest_seq = 0;
     uint32_t newest_addr = config_.start_addr;
     uint32_t newest_next_addr = config_.start_addr;
-
     uint32_t count = 0;
+    uint32_t min_seq = UINT32_MAX;
+    uint32_t min_addr = config_.start_addr;
 
     while(addr < config_.end_addr){
         LogFrameHeader header{};
         size_t frame_size = 0;
         if(isValidFrameAt(addr, &header, &frame_size)){
             uint32_t next_addr = wrapAddress(addr + static_cast<uint32_t>(frame_size));
+            if(header.seq < min_seq){
+                min_seq = header.seq;
+                min_addr = addr;
+            }
             if(!found){
                 found = true;
-                oldest_seq = header.seq;
-                oldest_addr = addr;
-
+                
                 newest_seq = header.seq;
                 newest_addr = addr;
                 newest_next_addr = next_addr;
@@ -178,11 +178,6 @@ bool FlashLogStorage::rebuildIndexFromFlash(){
                     newest_addr = addr;
                     newest_next_addr = next_addr;
                 }
-
-                if(isSeqNewer(oldest_seq, header.seq)){
-                    oldest_seq = header.seq;
-                    oldest_addr = addr;
-                }
             }
             count++;
             addr += static_cast<uint32_t>(frame_size);
@@ -191,22 +186,19 @@ bool FlashLogStorage::rebuildIndexFromFlash(){
         }
     }
     if(found){
-        oldest_addr_ = oldest_addr;
         newest_addr_ = newest_addr;
         newest_seq_ = newest_seq;
         write_addr_ = newest_next_addr;
         valid_frame_count_ = count;
     }else{
-        oldest_addr_ = config_.start_addr;
         newest_addr_ = config_.start_addr;
         newest_seq_ = 0;
         write_addr_ = config_.start_addr;
         valid_frame_count_ = 0;
     }
-    printf("rebuildIndex: found=%d count=%u oldest=0x%08X newest=0x%08X newest_seq=%u write=0x%08X\n",
+    printf("rebuildIndex: found=%d count=%u newest=0x%08X newest_seq=%u write=0x%08X\n",
            found ? 1 : 0,
            static_cast<unsigned>(valid_frame_count_),
-           oldest_addr_,
            newest_addr_,
            newest_seq_,
            write_addr_);
@@ -327,7 +319,7 @@ bool FlashLogStorage::isValidFrameAt(uint32_t addr, LogFrameHeader* out_header, 
 
     const uint32_t calc_crc = Crc32::calculate(frame_buf, frame_size - LOG_FRAME_CRC_SIZE);
 
-           if(calc_crc != stored_crc){
+    if(calc_crc != stored_crc){
         printf("!!! crc mismatch at 0x%08X\n", addr);
         return false;
     }
@@ -399,7 +391,7 @@ size_t FlashLogStorage::getRemainingSize() const {
 
 bool FlashLogStorage::readHeader(uint32_t addr, LogFrameHeader* out_header){
     if(out_header == nullptr) return false;
-    return flash_.read(addr, reinterpret_cast<uint8_t*>(out_header), sizeof(LogFrameHeader));
+    return flash_.read(addr + LOG_FRAME_MAGIC_SIZE, reinterpret_cast<uint8_t*>(out_header), sizeof(LogFrameHeader));
 }
 
 void FlashLogStorage::updateIndexAfterAppend(uint32_t frame_addr, const LogFrameHeader& header){
@@ -416,6 +408,7 @@ void FlashLogStorage::updateIndexAfterAppend(uint32_t frame_addr, const LogFrame
 }
 
 void FlashLogStorage::invalidateFramesInErasedSector(uint32_t sector_addr){
+
     if(valid_frame_count_ == 0) return;
 
     const uint32_t sector_end = sector_addr + FlashDriver::SECTOR_SIZE;
@@ -471,4 +464,111 @@ void FlashLogStorage::invalidateFramesInErasedSector(uint32_t sector_addr){
         newest_addr_ = config_.start_addr;
         newest_seq_ = 0;
     }
+}
+
+bool FlashLogStorage::readFrame(uint32_t addr, uint8_t* out, size_t out_size, size_t* out_len){
+    if(out == nullptr || out_len == nullptr){
+        printf("!!! %s: null arg\n", __func__);
+        return false;
+    }
+    *out_len = 0;
+    LogFrameHeader header{};
+    size_t frame_size = 0;
+    if(!isValidFrameAt(addr, &header, &frame_size)){
+        return false;
+    }
+    if(frame_size > out_size){
+        printf("!!! %s: buffer too small frame_size=%u out_size=%u\n",
+               __func__,
+               static_cast<unsigned>(frame_size),
+               static_cast<unsigned>(out_size));
+        return false;
+    }
+    if(!flash_.read(addr, out, frame_size)){
+        printf("!!! %s: flash read failed addr=0x%08X size=%u\n", __func__, addr, static_cast<unsigned>(frame_size));
+        return false;
+    }
+    *out_len = frame_size;
+//    printf("%s: OK addr=0x%08X seq=%u frame_size=%u\n", __func__, addr, header.seq, static_cast<unsigned>(frame_size));
+    return true;
+}
+/* テスト用の関数 */
+bool FlashLogStorage::readFramesOldestFirstTest(){
+    if(!initialized_) return false;
+    if(valid_frame_count_ == 0){
+        printf("readFramesOldestFirstTest: no valid frame\n");
+        return true;
+    }
+    uint8_t frame_buf[LOG_FRAME_MAX_SIZE];
+    uint32_t addr = oldest_addr_;
+    uint32_t read_count = 0;
+    uint32_t scanned = 0;
+    const uint32_t area_size = config_.end_addr - config_.start_addr;
+
+    printf("\n=== readFramesOldestFirstTest ===\n");
+    while(scanned < area_size){
+        LogFrameHeader header{};
+        size_t frame_size = 0;
+        if(isValidFrameAt(addr, &header, &frame_size)){
+            size_t read_len = 0;
+            if(!readFrame(addr, frame_buf, sizeof(frame_buf), &read_len)){
+                printf("!!! readFrame failed addr=0x%08X\n", addr);
+                return false;
+            }
+            printf("read frame: addr=0x%08X seq=%u size=%u len=%u\n", addr, header.seq, static_cast<unsigned>(read_len), header.length);
+            read_count++;
+            if(header.seq == newest_seq_){
+                break;
+            }
+            printf("addr before=0x%08X next=0x%08X\n",  addr, wrapAddress(addr + static_cast<uint32_t>(read_len)));
+            addr = wrapAddress(addr + static_cast<uint32_t>(read_len));
+            scanned += static_cast<uint32_t>(read_len);
+        } else {
+            addr = wrapAddress(addr + 1u);
+            scanned++;
+        }
+    }
+    printf("readFramesOldestFirstTest: read_count=%u\n", static_cast<unsigned>(read_count));
+    printf("=== readFrameOldestFirstTest done ===\n");
+    return true;
+}
+
+bool FlashLogStorage::sendFramesOldestFirst(UartDma& uart){
+    if(!initialized_) return false;
+    if(valid_frame_count_==0){
+        printf("sendFramesOldestFirst: no valid frame\n");
+        return true;
+    }
+    uint8_t frame_buf[LOG_FRAME_MAX_SIZE];
+    uint32_t addr = oldest_addr_;
+    uint32_t sent_count = 0;
+    uint32_t scanned = 0;
+
+    const uint32_t area_size = config_.end_addr - config_.start_addr;
+    printf("\n=== sendFramesOldestFirst ===\n");
+    while(scanned < area_size){
+        LogFrameHeader header{};
+        size_t frame_size = 0;
+        if(isValidFrameAt(addr, &header, &frame_size)){
+            size_t read_len = 0;
+            if(!readFrame(addr, frame_buf, sizeof(frame_buf), &read_len)){
+                printf("!!! %s: readFrame failed addr=0x%08X\n", __func__, addr);
+                return false;
+            }
+            uart.write_buffer_blocking(frame_buf, read_len);
+            sent_count++;
+            if(header.seq == newest_seq_){
+                break;
+            }
+            addr = wrapAddress(addr + static_cast<uint32_t>(read_len));
+            scanned += static_cast<uint32_t>(read_len);
+        }else{
+            addr = wrapAddress(addr + 1u);
+            scanned++;
+        }
+    }
+    printf("sendFramesOldestFirst: send_count=%u\n",
+        static_cast<unsigned>(sent_count));
+    printf("=== sendFramesoldestFirst done ===\n");
+    return true;
 }

@@ -333,3 +333,4 @@ void EventLogger::sendStats(){
         reinterpret_cast<const uint8_t*>(&stats),
         sizeof(stats));
 }  
+
