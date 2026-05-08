@@ -10,7 +10,7 @@ pico_sdk_init()
 
 include(FreeRTOS_Kernel_import.cmake)
 
-add_executable(event_logger
+add_executable(${PROJECT_NAME}
     src/main.cpp
     src/EventLogger.cpp
     src/led25.c
@@ -21,15 +21,16 @@ add_executable(event_logger
     src/FlashDriver.cpp
     src/Crc32.cpp
     src/DebugUtils.cpp
+    src/task_command.cpp
     check/check.cpp
 )
 
-target_include_directories(event_logger PRIVATE
+target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/include
     ${CMAKE_CURRENT_LIST_DIR}/check
 )
 
-target_link_libraries(event_logger
+target_link_libraries(${PROJECT_NAME}
     pico_stdlib
     FreeRTOS-Kernel
     FreeRTOS-Kernel-Heap4
@@ -41,10 +42,10 @@ target_link_libraries(event_logger
     hardware_spi
 )
 if (PICO_CYW43_SUPPORTED)
-    target_link_libraries(event_logger pico_cyw43_arch_none)
+    target_link_libraries(${PROJECT_NAME} pico_cyw43_arch_none)
 endif()
 
-pico_enable_stdio_usb(event_logger 1)
-pico_enable_stdio_uart(event_logger 0)
+pico_enable_stdio_usb(${PROJECT_NAME} 1)
+pico_enable_stdio_uart(${PROJECT_NAME} 0)
 
-pico_add_extra_outputs(event_logger)
+pico_add_extra_outputs(${PROJECT_NAME})

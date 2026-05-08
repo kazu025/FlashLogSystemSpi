@@ -1,2 +1,0 @@
-/home/kazu/mint/GitHubUp/018-FlashLogStorageRing/build/_deps/picotool-build/enc_bootloader_mbedtls/CMakeFiles/edit_cache.dir
-/home/kazu/mint/GitHubUp/018-FlashLogStorageRing/build/_deps/picotool-build/enc_bootloader_mbedtls/CMakeFiles/rebuild_cache.dir

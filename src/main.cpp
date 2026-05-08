@@ -11,6 +11,7 @@
 #include "DebugUtils.h"
 #include <cstring>
 #include "check.h"
+#include "AppTasks.h"
 
 static FlashDriver* g_flash_driver = nullptr;
 static FlashLogStorage* g_log_storage = nullptr;
@@ -23,6 +24,7 @@ static constexpr UBaseType_t LOGGER_TASK_PRIORITY = 2;
 static constexpr uint32_t LOG_START_ADDR = 0x00001000;
 static constexpr uint32_t LOG_END_ADDR = 0x00003000;
 static void app_task(void *arg);
+static AppContext app_ctx;
 
 int main(){
     stdio_init_all();
@@ -51,7 +53,7 @@ int main(){
     }
     g_log_storage = &storage;
     /* テスト段階では、起動時にログ領域を消す */
-    printf("erase log area ... \r\n");
+//    printf("erase log area ... \r\n");
     if(!storage.eraseLogArea()){
         printf("!!! storage.eraseLogArea() failed\r\n");
         while(true) tight_loop_contents();
@@ -79,6 +81,13 @@ int main(){
         printf("!!! xTaskCreate(app_task) failed\n");
         while(true) tight_loop_contents();
     }
+    app_ctx.storage = &storage;
+    app_ctx.uart = &uart_dma;
+    ok = xTaskCreate(command_task, "cmd", 512, &app_ctx, 1, nullptr);
+    if(ok != pdPASS){
+        printf("!!! xTaskCreate(command_task) failed\n");
+        while(true) tight_loop_contents();
+    }
     vTaskStartScheduler();
     /* 通常ここは来ない */
     printf("!!! Scheduler return\n");
@@ -87,24 +96,15 @@ int main(){
 
 /* === タスク === */
 static void app_task(void *arg){
-    (void)arg;
-//    EventLogger* logger = static_cast<EventLogger*>(arg);
+    EventLogger* logger = static_cast<EventLogger*>(arg);
     led_init();
-
-    if(!test_flash_storage_restore_after_wrap(*g_log_storage, *g_logger)){
-        printf("!!! test_flash_storage_restore_after_wrap failed\n");
-    }
-    g_log_storage->dumpFramesOldestFirst();
-
-    if(!test_flash_storage_dump_oldest_first(*g_log_storage)){
-        printf("!!! test_flash_storage_dump_oldest_first failed\n");
-    }
-    g_log_storage->dumpFramesOldestFirst();
-    g_log_storage->readFramesOldestFirstTest();
-    printf("send flash logs to Uart...\n");
-    g_log_storage->sendFramesOldestFirst(*g_uart_dma);
+    uint32_t count = 0;
     while(true){
-        led_sw();
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        if(!isLogPaused()){
+            logger->logf(LogLevel::INFO , "wrap restore frame%u", count);
+            count ++;
+            led_onoff(count%2 ? true: false);
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }

@@ -1,597 +1,650 @@
 ````markdown
-# FlashLogStorageRing
+# FlashLogNUartOut
 
-Raspberry Pi Pico（RP2040）で、外付けSPI Flashにバイナリログを保存し、リングバッファとして古いログを上書きしながら保持する実験プロジェクトです。
+Raspberry Pi Pico + FreeRTOS + UART DMA + SPI Flash を使った、実験用のフラッシュログ保存システムです。
 
-保存したログは、再起動後にFlashから復元し、古い順にUARTへ再送信できます。PC側の `logger_viewer.py` で受信すると、保存済みログを通常のUARTログと同じ形式で復元できます。
+通常動作中に生成したログを外部SPI Flashへ保存し、USB CDCコマンドから以下の操作ができます。
 
-## 特徴
+- Flashログの全件UART出力
+- 最新N件だけUART出力
+- ログ生成の一時停止 / 再開
+- ログ領域のerase
+- FlashLogStorageの状態表示
 
-- Raspberry Pi Pico + 外付けSPI Flashを使用
-- Flash上にログ保存領域を作成
-- ログをバイナリフレーム形式で保存
-- CRC32でフレーム破損を検出
-- Flashログ領域をリングバッファとして使用
-- Flash再起動後にログインデックスを復元
-- 古い順にログを読み出し
-- 保存済みログをUARTへ再送信
-- PC側Viewerでログを復元可能
+UART出力されたログは、PC側の `logger_viewer.py` で受信・CRC確認・seq確認できます。
+
+---
 
 ## 目的
 
-組み込み機器では、異常発生時のログを後から取り出したいことがあります。
+組込み機器では、実行中のログをすべてUARTへ出し続けると、通信帯域不足や取りこぼしが起きることがあります。
 
-UARTへリアルタイム送信するだけでは、PCを接続していない間のログは失われます。そこで、ログを外付けFlashに保存し、必要なタイミングでUARTから取り出せるようにします。
+このプロジェクトでは、ログをいったん外部SPI Flashへ保存し、必要なタイミングで後から取り出せる仕組みを作っています。
 
-このプロジェクトでは、以下の流れを確認しています。
+主な目的は以下です。
 
-```text
-ログ生成
-  ↓
-バイナリフレーム化
-  ↓
-SPI Flashへ保存
-  ↓
-リングバッファとして古いログを上書き
-  ↓
-再起動後にFlashをスキャンして復元
-  ↓
-古い順に読み出し
-  ↓
-UARTへ再送信
-  ↓
-PC Viewerで復元
-````
+- 実機上で発生したイベントをFlashに保存する
+- 起動後にFlash上の有効ログを復元する
+- リングバッファ方式で古いログを上書きする
+- 最新N件だけを後からUARTへ再出力する
+- Viewer側でCRCとseqを確認できるようにする
+- FreeRTOS環境でFlashアクセスをMutex保護する
 
-## 動作確認済みの内容
+---
 
-以下の流れを確認済みです。
-
-```text
-Flash保存
-restoreWriteAddress()
-dumpFramesOldestFirst()
-readFrame()
-readFramesOldestFirstTest()
-sendFramesOldestFirst()
-logger_viewer.pyで受信
-CRC OK
-seq OK
-```
-
-Viewer側では、保存済みログが以下のように復元されました。
-
-```text
-seq=106 ... crc=OK seq_ok=1
-seq=107 ... crc=OK seq_ok=1
-...
-seq=300 ... crc=OK seq_ok=1
-```
-
-つまり、Flash上に残っている有効ログを、古い順にUARTへ送信できています。
-
-## ハードウェア構成
-
-想定している構成は以下です。
+## システム構成
 
 ```text
 Raspberry Pi Pico
   |
-  | SPI
+  +-- FreeRTOS
   |
-外付けSPI Flash
+  +-- EventLogger
+  |     |
+  |     +-- LogFrame生成
   |
-  | UART
+  +-- FlashLogStorage
+  |     |
+  |     +-- SPI Flashへ保存
+  |     +-- リングバッファ管理
+  |     +-- 起動時restore
+  |     +-- 最新N件出力
+  |     +-- 全件出力
   |
+  +-- UartDma
+  |     |
+  |     +-- UART DMAでPCへバイナリログ送信
+  |
+  +-- USB CDC
+        |
+        +-- コマンド入力
+````
+
+PC側では、UARTに接続した `logger_viewer.py` がバイナリログを受信します。
+
+```text
+Pico UART
+  ↓
 USB-UART変換
-  |
-PC Viewer
+  ↓
+PC /dev/ttyUSB0
+  ↓
+logger_viewer.py
 ```
 
-## 使用している主な要素
+USB CDCはコマンド操作用です。
 
-* Raspberry Pi Pico / RP2040
-* Pico SDK
-* C++
-* SPI Flash
-* UART
-* バイナリログフレーム
-* CRC32
-* リングバッファ
-* Python製ログViewer
+```text
+Pico USB CDC
+  ↓
+PC /dev/ttyACM0
+  ↓
+picocom / minicom
+```
 
-## Flashログ領域
+---
 
-Flash上の一部領域をログ保存用として使います。
+## 主な機能
 
-ログ領域の開始アドレスと終了アドレスは、ヘッダ側の定数で定義します。
+### 1. Flashリングバッファ保存
+
+ログフレームを外部SPI Flashに保存します。
+
+ログ保存領域はセクタ単位で管理します。
+
+```text
+LOG_START_ADDR ～ LOG_END_ADDR
+```
+
+現在のテストでは例として以下のような領域を使用しています。
+
+```text
+start = 0x00001000
+end   = 0x00003000
+size  = 8192 bytes
+```
+
+ログ領域は `FlashLogStorage` の設定で変更できます。
+
+---
+
+### 2. 起動時restore
+
+起動時にFlashログ領域をスキャンし、有効なログフレームを探します。
+
+復元する情報は以下です。
+
+* 最古ログアドレス
+* 最新ログアドレス
+* 最新seq
+* 次回書き込みアドレス
+* 有効フレーム数
+
+これにより、再起動後もFlashに残っているログを読み出せます。
+
+---
+
+### 3. 最新N件UART出力
+
+USB CDCコマンドから、最新N件だけをUARTへ出力できます。
 
 例：
 
-```cpp
-LOG_START_ADDR
-LOG_END_ADDR
+```text
+l10
+l20
+l100
 ```
 
-ログ領域は、Flashのセクタサイズに揃える必要があります。
+出力順は、Viewerで見やすいように古い順です。
 
-```cpp
-start_addr % SECTOR_SIZE == 0
-end_addr   % SECTOR_SIZE == 0
-```
-
-## ログフレーム構造
-
-Flashには、UART送信時と同じバイナリフレームを保存します。
+例：Flash内の最新seqが `300` の場合
 
 ```text
-+--------+--------+---------+------+
-| magic  | header | payload | CRC  |
-+--------+--------+---------+------+
+l10
 ```
 
-### magic
+を実行すると、
 
-フレームの先頭を識別するための固定値です。
+```text
+seq=291
+seq=292
+...
+seq=300
+```
+
+の順で出力します。
+
+---
+
+### 4. 全件UART出力
+
+Flash内の有効ログを、古い順ですべてUARTへ出力できます。
+
+```text
+a
+```
+
+リングバッファとして保存されている範囲を、最古ログから最新ログまで順に送信します。
+
+---
+
+### 5. pause / resume
+
+ログ生成中にFlashリプレイを実行すると、通常ログと過去ログが混ざる可能性があります。
+
+そのため、USB CDCコマンドで通常ログ生成を一時停止できます。
+
+```text
+p : pause log generation
+r : resume log generation
+```
+
+基本的な使い方は以下です。
+
+```text
+p
+l20
+r
+```
+
+意味：
+
+```text
+p    通常ログ生成を停止
+l20  Flash内の最新20件をUARTへ出力
+r    通常ログ生成を再開
+```
+
+これにより、リプレイ中に新しいログが混ざることを防ぎます。
+
+---
+
+### 6. FreeRTOS Recursive Mutexによる排他
+
+FlashLogStorageでは、Flashアクセスと内部状態更新を保護するためにFreeRTOSのRecursive Mutexを使用します。
+
+対象となる主な処理は以下です。
+
+* `append()`
+* `eraseLogArea()`
+* `read()`
+* `readFrame()`
+* `sendFramesOldestFirst()`
+* `sendLatestFrames()`
+* `restoreWriteAddress()`
+
+`sendLatestFrames()` や `sendFramesOldestFirst()` は内部で `readFrame()` を呼ぶため、通常のMutexではなくRecursive Mutexを使用しています。
+
+これにより、同じタスク内で再帰的にロックしてもデッドロックしないようにしています。
+
+---
+
+## ログフレーム仕様
+
+ログはバイナリフレームとして保存・送信します。
+
+基本構造は以下です。
+
+```text
+Magic  + Header + Payload + CRC32
+```
+
+### フレーム構造
+
+```text
+Magic       : 2 bytes
+Header      : 12 bytes
+Payload     : variable
+CRC32       : 4 bytes
+```
+
+### Magic
 
 ```text
 0xA5 0x5A
 ```
 
-### header
+### Header
 
-ログのメタ情報を持ちます。
-
-主な情報：
-
-* sequence number
-* event id
-* log level
-* payload length
-* timestamp
-
-### payload
-
-ログ本文です。
-
-テキストログの場合は文字列が入ります。
+```cpp
+struct LogFrameHeader {
+    uint32_t seq;
+    uint16_t event_id;
+    uint8_t  level;
+    uint8_t  length;
+    uint32_t timestamp_us;
+};
+```
 
 ### CRC
 
-magic、header、payloadを対象にCRC32を計算し、フレーム末尾に付加します。
-
-読み出し時にはCRCを再計算し、保存されたCRCと一致するか確認します。
-
-## リングバッファ動作
-
-Flashは、基本的に1bitを `1` から `0` にする方向へしか書き換えられません。
-
-そのため、上書きするにはセクタ単位でeraseする必要があります。
-
-このプロジェクトでは、次のように動作します。
+CRC32は以下を対象に計算します。
 
 ```text
-現在の書き込み位置にログを書く
-  ↓
-セクタ末尾を跨ぐ場合は次のセクタへ移動
-  ↓
-次の書き込み位置がセクタ先頭なら、そのセクタをerase
-  ↓
-erase対象セクタに含まれる古いログをindexから除外
-  ↓
-新しいログを書き込む
+Magic + Header + Payload
 ```
 
-ログ領域の終端に到達した場合は、開始アドレスへ戻ります。
+CRCフィールド自体は計算対象に含めません。
 
-```text
-LOG_END_ADDR到達
-  ↓
-LOG_START_ADDRへwrap
-```
+---
 
-## 注意点
+## USB CDCコマンド
 
-Flashのerase単位はセクタです。
-
-そのため、ログは1フレームずつ消えるのではなく、セクタ単位でまとめて消えます。
-
-例：
-
-```text
-seq=1〜105  : erase済み
-seq=106〜300: 有効ログとして残っている
-```
-
-このように、最古ログが `seq=1` ではなく、途中の `seq=106` から始まることがあります。
-
-これはリングバッファとして正常な動作です。
-
-## インデックス管理
-
-`FlashLogStorage` は以下の情報を保持します。
-
-```cpp
-write_addr_
-oldest_addr_
-newest_addr_
-newest_seq_
-valid_frame_count_
-```
-
-### write_addr_
-
-次にログを書き込むアドレスです。
-
-### oldest_addr_
-
-現在Flash上に残っている有効ログのうち、最も古いログのアドレスです。
-
-### newest_addr_
-
-現在Flash上に残っている有効ログのうち、最も新しいログのアドレスです。
-
-### newest_seq_
-
-最新ログのsequence numberです。
-
-### valid_frame_count_
-
-有効なログフレーム数です。
-
-## 再起動後の復元
-
-再起動するとRAM上のインデックス情報は失われます。
-
-そのため、初期化時にFlashログ領域をスキャンして、有効フレームを探します。
-
-```cpp
-restoreWriteAddress();
-```
-
-内部では、Flash全体をスキャンし、CRCが正しいフレームだけを有効ログとして扱います。
-
-```text
-Flashログ領域を先頭からスキャン
-  ↓
-magic確認
-  ↓
-header読み出し
-  ↓
-payload length確認
-  ↓
-CRC確認
-  ↓
-有効フレームとして採用
-```
-
-これにより、再起動後でも以下を復元できます。
-
-* 次の書き込み位置
-* 最古ログの位置
-* 最新ログの位置
-* 有効ログ数
-
-## 古い順の読み出し
-
-保存されたログは、`oldest_addr_` から読み始めます。
-
-```cpp
-dumpFramesOldestFirst();
-```
-
-この関数は、Flash上の有効フレームを古い順に表示します。
-
-リングバッファなので、物理アドレス順とは限りません。
-
-例：
-
-```text
-0x2000 seq=106
-0x2028 seq=107
-...
-0x2FC8 seq=207
-0x1000 seq=208
-0x1028 seq=209
-...
-0x1E60 seq=300
-```
-
-このように、途中でFlashログ領域の先頭へwrapします。
-
-## 保存ログのUART送信
-
-保存済みログは、以下の関数でUARTへ送信できます。
-
-```cpp
-sendFramesOldestFirst(uart_dma);
-```
-
-内部では、Flashから1フレームずつ読み出し、バイナリフレームをそのままUARTへ送信します。
-
-```text
-oldest_addr_から開始
-  ↓
-readFrame()
-  ↓
-uart.write_buffer_blocking()
-  ↓
-次フレームへ
-  ↓
-newest_seq_まで繰り返し
-```
-
-PC側では通常のリアルタイムログと同じように受信できます。
-
-## PC側Viewer
-
-PC側では `logger_viewer.py` を使用します。
+USB CDC側でコマンドを入力します。
 
 例：
 
 ```bash
-cd debug
+picocom /dev/ttyACM0 -b 115200
+```
+
+### コマンド一覧
+
+```text
+h       help表示
+s       FlashLogStorage状態表示
+p       ログ生成pause
+r       ログ生成resume
+a       全件を古い順にUART出力
+lN      最新N件をUART出力
+e       ログ領域erase
+```
+
+### 使用例
+
+```text
+s
+```
+
+状態表示：
+
+```text
+=== FlashLogStorage Status ===
+start   = 0x00001000
+end     = 0x00003000
+write   = 0x00001386
+oldest  = 0x00001000
+newest  = 0x00001360
+count   = 24
+remain  = 7290
+Paused  = no
+==============================
+```
+
+最新10件出力：
+
+```text
+p
+l10
+r
+```
+
+全件出力：
+
+```text
+p
+a
+r
+```
+
+ログ領域erase：
+
+```text
+p
+e
+s
+```
+
+erase後は以下のようになります。
+
+```text
+count   = 0
+write   = start address
+remain  = log area size
+```
+
+---
+
+## logger_viewer.py の使い方
+
+UART側のバイナリログをPCで受信します。
+
+例：
+
+```bash
 ./logger_viewer.py --port /dev/ttyUSB0 --baud 460800
 ```
 
-出力例：
+正常に受信できると、以下のように表示されます。
 
 ```text
-seq=106 INFO TEXT_LOG msg="wrap restore frame 105" crc=OK seq_ok=1
-seq=107 INFO TEXT_LOG msg="wrap restore frame 106" crc=OK seq_ok=1
-...
-seq=300 INFO TEXT_LOG msg="wrap restore frame 299" crc=OK seq_ok=1
+[ 839165003 us] seq=29 INFO TEXT_LOG msg="wrap restore frame29" crc=OK seq_ok=1 ok=1 ng=0 gap=0 late=0 dup=0
+[ 839664997 us] seq=30 INFO TEXT_LOG msg="wrap restore frame30" crc=OK seq_ok=1 ok=2 ng=0 gap=0 late=0 dup=0
 ```
+
+重要な確認ポイントは以下です。
+
+```text
+crc=OK
+crc_ng=0
+gap=0
+```
+
+---
+
+## late / dup について
+
+Flashリプレイでは、すでにViewerが受信済みのseqを再送することがあります。
+
+その場合、Viewerでは以下のような表示になることがあります。
+
+```text
+late
+dup
+```
+
+これは必ずしも異常ではありません。
+
+### late
+
+すでに新しいseqを見たあとに、古いseqが来たという意味です。
+
+例：
+
+```text
+seq=20 を受信済み
+その後に seq=10 が来た
+```
+
+### dup
+
+同じseqをもう一度受信したという意味です。
+
+例：
+
+```text
+seq=20 を受信済み
+その後にまた seq=20 が来た
+```
+
+Flashリプレイでは、過去ログを再送するため `late` や `dup` が出ることがあります。
+
+ただし、以下が正常ならFlash読み出しやUART送信は正常です。
+
+```text
+crc=OK
+crc_ng=0
+```
+
+---
 
 ## ビルド方法
 
-Pico SDKの環境変数を設定しておきます。
+例：
 
 ```bash
-export PICO_SDK_PATH=/path/to/pico-sdk
+mkdir -p debug
+cd debug
+cmake ..
+make -j4
 ```
 
-ビルドスクリプトを使う場合：
+または、プロジェクトに `mk.sh` がある場合は以下でビルドします。
 
 ```bash
 ./mk.sh
 ```
 
-または手動でビルドする場合：
+---
 
-```bash
-mkdir -p build
-cd build
-cmake ..
-make -j4
+## CMake設定の注意
+
+USB CDCをコマンド用に使い、UARTをバイナリログ専用にするため、CMakeでは以下のようにするのが望ましいです。
+
+```cmake
+pico_enable_stdio_usb(event_logger 1)
+pico_enable_stdio_uart(event_logger 0)
 ```
 
-生成された `.uf2` ファイルをPicoへ書き込みます。
+`event_logger` は実際のターゲット名に合わせてください。
 
-## ディレクトリ構成例
+この構成にすると、
 
 ```text
-.
-├── CMakeLists.txt
-├── README.md
-├── include
-│   ├── FlashDriver.h
-│   ├── FlashLogStorage.h
-│   ├── LogProtocol.h
-│   ├── LogTypes.h
-│   ├── EventLogger.h
-│   └── UartDma.h
-├── src
-│   ├── FlashDriver.cpp
-│   ├── FlashLogStorage.cpp
-│   ├── EventLogger.cpp
-│   ├── UartDma.cpp
-│   ├── Crc32.cpp
-│   └── main.cpp
-├── check
-│   └── check.cpp
-└── debug
-    └── logger_viewer.py
+USB CDC:
+    printf表示
+    コマンド入力
+
+UART:
+    バイナリログ出力
 ```
 
-## 主なクラス
+を分離できます。
 
-### FlashDriver
+UART側に `printf()` の文字列が混ざると、`logger_viewer.py` のバイナリ解析を邪魔する可能性があります。
 
-SPI Flashの低レベル操作を担当します。
+---
 
-主な機能：
+## FreeRTOSConfig.h の注意
 
-* JEDEC ID読み出し
-* Read
-* Page Program
-* Sector Erase
-* Write Enable
-* Busy Wait
+Recursive Mutexを使うため、`FreeRTOSConfig.h` で以下が有効になっている必要があります。
 
-### FlashLogStorage
+```c
+#define configUSE_MUTEXES 1
+#define configUSE_RECURSIVE_MUTEXES 1
+```
 
-Flash上にログを保存する管理クラスです。
+---
 
-主な機能：
+## 動作確認済みの項目
 
-* ログ追記
-* リングバッファ管理
-* セクタerase時のインデックス更新
-* 再起動後のインデックス復元
-* 古い順のログ読み出し
-* UARTへの保存ログ送信
+以下を確認済みです。
 
-### EventLogger
-
-ログイベントを作成し、バイナリフレーム化します。
-
-### UartDma
-
-UART送信を担当します。
-
-保存済みログの送信時にも使用します。
-
-## 代表的な処理の流れ
-
-### ログ保存
+### 最新N件出力
 
 ```text
-EventLogger
-  ↓
-LogProtocolでバイナリフレーム生成
-  ↓
-FlashLogStorage::append()
-  ↓
-Flashへ保存
+l1
+l5
+l10
+l20
+l100
 ```
 
-### 保存ログの復元
-
-```text
-FlashLogStorage::init()
-  ↓
-restoreWriteAddress()
-  ↓
-rebuildIndexFromFlash()
-  ↓
-oldest/newest/write_addrを復元
-```
-
-### 保存ログのUART送信
-
-```text
-FlashLogStorage::sendFramesOldestFirst()
-  ↓
-readFrame()
-  ↓
-uart.write_buffer_blocking()
-  ↓
-logger_viewer.pyで受信
-```
-
-## テスト内容
-
-### wrap後のrestore確認
-
-ログ領域の終端まで書き込み、開始アドレスへwrapした後でも、再起動相当の復元で正しいwrite addressが復元されることを確認します。
-
-確認例：
-
-```text
-wrap detected
-expected write_addr=0x00001E88
-restored write_addr=0x00001E88
-restore after wrap OK
-```
-
-### 古い順dump確認
-
-保存済みログを古い順に表示します。
-
-確認例：
-
-```text
-oldest=0x00002000 newest=0x00001E60 newest_seq=300 count=195
-frame: addr=0x00002000 seq=106
-...
-frame: addr=0x00001E60 seq=300
-```
-
-### 古い順read確認
-
-`readFrame()` を使い、Flash上のフレーム本体を古い順に読み出します。
-
-確認例：
-
-```text
-readFramesOldestFirstTest: read_count=195
-```
-
-### UART再送信確認
-
-保存済みログをUARTへ再送信し、PC側Viewerで確認します。
-
-確認例：
-
-```text
-seq=106 crc=OK seq_ok=1
-...
-seq=300 crc=OK seq_ok=1
-```
-
-## 現在できていること
-
-* Flashにログを保存できる
-* Flashログ領域をリングバッファとして扱える
-* セクタerase時に古いログを無効化できる
-* 再起動後にFlashからインデックスを復元できる
-* 保存済みログを古い順に読める
-* 保存済みログをUARTに再送信できる
-* PC側ViewerでCRC OK / seq OKを確認できる
-
-## 今後の改善候補
-
-### デバッグ出力の整理
-
-動作確認用の `printf()` が多いため、本番用には整理します。
+期待通り、最新N件が古い順で出力されました。
 
 例：
 
-```cpp
-readFrame: OK ...
-addr before=...
+```text
+l10 → 最新10件を出力
 ```
 
-これらはデバッグ時のみ有効にするのが望ましいです。
+### erase後の空ログ処理
 
-### 電源断対策
+erase直後に以下を実行しても正常に処理されます。
 
-現在はCRCが正しいフレームのみを有効扱いするため、書き込み途中で電源断が起きても、壊れたフレームは無視できます。
+```text
+a
+l10
+```
 
-ただし、より堅牢にするなら以下を検討できます。
+表示例：
 
-* フレーム書き込み完了マーカー
-* sector単位のメタデータ
-* 起動時の詳細な修復処理
+```text
+sendFramesOldestFirst: no valid frame
+sendLatestFrames: no valid frame
+```
 
-### インデックス更新の最適化
+### pause / resume
 
-現在はFlashスキャンにより復元します。
+```text
+p
+s
+l20
+r
+s
+```
 
-ログ領域が大きくなると起動時スキャン時間が増えるため、将来的には以下を検討できます。
+により、ログ生成停止・リプレイ・再開を確認しました。
 
-* sector header
-* checkpoint情報
-* 最新write address保存領域
+### 全件出力
 
-### 読み出し条件の追加
+`a` コマンドで、Flash内の全有効ログを古い順で出力できることを確認しました。
 
-現在は保存済みログをすべて送信します。
+例：
 
-将来的には以下も追加できます。
+```text
+seq=29
+seq=30
+...
+seq=67
+```
 
-* 最新N件だけ送信
-* 指定seq以降だけ送信
-* event_idでフィルタ
-* levelでフィルタ
+39件が古い順で出力され、以下を確認しました。
 
-## メモ
+```text
+crc_ng=0
+gap=0
+late=0
+dup=0
+```
 
-Flashはセクタ単位でeraseする必要があります。
+### Mutex確認
 
-そのため、リングバッファとして使う場合、古いログはセクタ単位で消えます。
+`send latest` や `send all` 実行後に `send done` まで戻り、resume後も通常ログ生成が再開することを確認しました。
 
-これはFlashの仕様に沿った自然な動作です。
+つまり、Recursive Mutex導入後もデッドロックは発生していません。
+
+---
+
+## 現在の到達点
+
+このプロジェクトでは、以下の基本機能が動作しています。
+
+```text
+Flash保存
+リングバッファ管理
+起動時restore
+全件読み出し
+最新N件読み出し
+USB CDCコマンド操作
+pause/resume
+FreeRTOS Mutex排他
+ViewerでCRC確認
+```
+
+実用的なFlashログ機構の基本形として使える段階です。
+
+---
+
+## 今後の課題
+
+今後の改善候補です。
+
+### 1. 長時間耐久テスト
+
+数千〜数万件のログを書き込み、リング周回後も以下が正しく動くか確認します。
+
+* restore
+* latest N
+* all replay
+* erase
+* CRC確認
+
+### 2. 電源断復旧テスト
+
+Flash書き込み途中で電源断が起きた場合でも、有効なフレームだけを復元できるか確認します。
+
+### 3. logger_viewer.py のリプレイモード
+
+Flashリプレイ時は `late` / `dup` が出やすいため、Viewer側にリプレイモードを追加すると見やすくなります。
+
+例：
+
+```bash
+./logger_viewer.py --port /dev/ttyUSB0 --baud 460800 --replay
+```
+
+リプレイモードでは、seqが戻っても警告扱いしないようにできます。
+
+### 4. ログ検索機能
+
+将来的には以下のような検索機能を追加できます。
+
+* event_id指定
+* seq範囲指定
+* 最新エラーのみ出力
+* 指定レベル以上のみ出力
+
+### 5. Flash使用量の可視化
+
+USB CDCの `s` コマンドで、Flash使用率を表示できるようにすると便利です。
+
+例：
+
+```text
+used    = 1482
+remain  = 6710
+usage   = 18%
+```
+
+---
 
 ## ライセンス
 
-このプロジェクトの自作ソースコードは MIT License で公開します。
+このプロジェクト内の自作コードは、MIT Licenseなどの任意のライセンスで公開できます。
 
-Raspberry Pi Pico SDK は BSD-3-Clause License、FreeRTOS は MIT License で提供されています。  
-それぞれの外部ライブラリを使用する場合は、各プロジェクトのライセンス条件に従ってください。
+Pico SDK、FreeRTOS、TinyUSBなどの外部ライブラリについては、それぞれのライセンスに従ってください。
 
-詳細は `LICENSE` ファイルを参照してください。
 
+---
+
+## メモ
+
+このプロジェクトは学習・実験用です。
+
+Raspberry Pi Pico、FreeRTOS、UART DMA、SPI Flash、CRC、リングバッファ、Mutex排他を組み合わせた、組込みログ機構の実装例として作成しています。
+
+```
 ```
 

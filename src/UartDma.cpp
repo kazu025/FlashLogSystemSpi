@@ -51,8 +51,8 @@ bool UartDma::init(){
 	assert(is_power_of_two(tx_size_));
 	assert(is_power_of_two(rx_size_));
 	if(rx_size_ < 2 || rx_size_ > 32768 || !is_power_of_two(rx_size_) || !is_power_of_two(tx_size_)){
-		printf("Error: tx_size_ and rx_size_ must be power of two\n");
-		printf("Error: rx_size_ must be 2 to 32768\n");
+		printf("!!! tx_size_ and rx_size_ must be power of two\n");
+		printf("!!! rx_size_ must be 2 to 32768\n");
 		return true;
 	}
 	// claim channels
