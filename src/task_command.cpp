@@ -70,6 +70,7 @@ void command_task(void *pvParameters){
     }
     FlashLogStorage& storage = *ctx->storage;
     UartDma& uart = *ctx->uart;
+    EventLogger& logger = *ctx->logger;
 
     static constexpr size_t CMD_BUF_SIZE = 32;
     char cmd_buf[CMD_BUF_SIZE];
@@ -107,6 +108,7 @@ void command_task(void *pvParameters){
                 }else if(strcmp(cmd_buf, "e") == 0 || strcmp(cmd_buf, "E") == 0){
                     printf("erase log area...\n");
                     if(storage.eraseLogArea()){
+                        logger.setNextSeq(0); 
                         printf("erase done.\n");
                     } else {
                         printf("!!! erase failed.\n");

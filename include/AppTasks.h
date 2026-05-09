@@ -8,10 +8,11 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "FlashLogStorage.h"
-
+#include "EventLogger.h"
 struct AppContext {
     FlashLogStorage* storage;
     UartDma* uart;
+    EventLogger* logger;
 };
 void command_task(void *pvParameters);
 bool isLogPaused();

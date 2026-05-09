@@ -4,9 +4,14 @@
 #include "check.h"
 #include <stdio.h>
 #include <string.h>
-
+#include "FlashDriver.h"
 
 static constexpr uint32_t TEST_ADDR = FlashLogStorage::LOG_START_ADDR;
+static bool make_text_frame(EventLogger& logger, uint32_t seq, const char* msg, uint8_t* frame,size_t frame_buf_size, size_t* frame_len);
+static void dump_flash_binary_for_viewer(FlashDriver& flash, uint32_t addr, size_t len);
+static bool rawProgramForTest(FlashDriver& flash, uint32_t addr, const uint8_t* data, size_t len);
+static size_t buildTextFrameForTest(EventLogger &logger, int32_t seq, const char* text, uint8_t* out_buf, size_t out_buf_size);
+static void printStorageStatus(const char* title, const FlashLogStorage& storage);
 
 size_t g_flash_log_dump_len = 0;
 
@@ -618,10 +623,115 @@ bool test_flash_storage_dump_oldest_first(FlashLogStorage& storage){
     return true;
 }
 
+static bool rawProgramForTest(FlashDriver& flash, uint32_t addr, const uint8_t* data, size_t len){
+    while(len>0){
+        uint32_t page_remain = FlashDriver::PAGE_SIZE - (addr % FlashDriver::PAGE_SIZE);
+        size_t chunk = len;
 
+        if(chunk > page_remain){
+            chunk = page_remain;
+        }
+        if(!flash.pageProgram(addr, data, chunk)){
+            return false;
+        }
+        addr += chunk;
+        data += chunk;
+        len -= chunk;
+    }
+    return true;
+}
 
+static size_t buildTextFrameForTest(EventLogger &logger, int32_t seq, const char* text, uint8_t* out_buf, size_t out_buf_size){
+    LogEvent event{};
 
+    event.seq = seq;
+    event.timestamp_us = time_us_32();
+    event.level = LogLevel::INFO;
+    event.event_id = EventId::TEXT_LOG;
 
+    size_t len = strlen(text);
+    if(len > LOG_PAYLOAD_MAX){
+        len = LOG_PAYLOAD_MAX;
+    }
+    event.length = static_cast<uint8_t>(len);
+    memcpy(event.payload, text, len);
+
+    return logger.buildFrame(event, out_buf, out_buf_size);
+}
+
+void test_pseudo_power_cut(FlashDriver& flash){
+    printf("\n=== test_pseudo_power_cut ===\n");
+    constexpr uint32_t LOG_START_ADDR = 0x00001000;
+    constexpr uint32_t LOG_END_ADDR = 0x00003000;
+
+    UartDma uart(uart0, UartDma::UART_BAUDRATE_460800, UartDma::UART_TX_PIN, UartDma::UART_RX_BUF_SIZE); 
+    uart.init();
+ 
+    FlashLogStorage storage(flash, LOG_START_ADDR, LOG_END_ADDR);
+    storage.init();
+    EventLogger logger(uart, &storage);
+    logger.init(32);
+
+    printf("erase log area ...\n");
+    storage.eraseLogArea();
+    printf("erase done\n");
+    storage.restoreWriteAddress();
+    uint8_t frame_buf[128];
+    // 1.正常frameをかく(5個)
+    for(uint32_t i = 0; i<5; i++){
+        char msg[64];
+        snprintf(msg, sizeof(msg), "normal frame %lu", static_cast<unsigned long>(i));
+        size_t frame_len = buildTextFrameForTest(logger, i, msg, frame_buf, sizeof(frame_buf));
+        if(!storage.append(frame_buf, frame_len)){
+            printf("append failed at seq=%lu\n", static_cast<unsigned long>(i));
+            return;
+        }
+    }
+    printf("\n--- before pseudo power cut ---\n");
+    storage.printStatus("storage");
+    uint32_t cut_addr = storage.getWriteAddressForTest();
+    printf("pseudo power cut addr=0x%08lX\n", static_cast<unsigned long>(cut_addr));
+    // 2.次のフレームを作る
+    size_t bad_frame_len = buildTextFrameForTest(logger, 5, "this frame is partially written", frame_buf, sizeof(frame_buf));
+    printf("full frame len=%u\n", static_cast<unsigned>(bad_frame_len));
+    // 3.フレーム先頭だけ書く
+    // 例: magic + header の途中まで書く
+    constexpr size_t CUT_LEN = 8;
+    printf("write only first %u bytes\n", static_cast<unsigned>(CUT_LEN));
+    if(!rawProgramForTest(flash, cut_addr, frame_buf, CUT_LEN)){
+        printf("rawProgramForTest failed\n");
+        return;
+    }
+    // 4.再起動相当
+    FlashLogStorage restored(flash, LOG_START_ADDR, LOG_END_ADDR);
+    restored.init();
+    printf("\n--- after pseudo reboot / restore ---\n");
+    restored.printStatus("restored");
+    // 5. 続けて３メッセージ書く
+    for (uint32_t i = 5; i < 8; i++) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "after restore frame %lu",
+                 static_cast<unsigned long>(i));
+
+        size_t frame_len = buildTextFrameForTest(
+            logger, i, msg, frame_buf, sizeof(frame_buf));
+
+        if (!restored.append(frame_buf, frame_len)) {
+            printf("append after restore failed seq=%lu\n",
+                static_cast<unsigned long>(i));
+            return;
+        }
+    }
+
+    restored.printStatus("after append following restore");
+
+    printf("\n--- read frames oldest first after restore append ---\n");
+
+    if (!restored.readFramesOldestFirstTest()) {
+        printf("!!! readFramesOldestFirstTest failed\n");
+        return;
+    }
+}
 
 
 

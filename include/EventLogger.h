@@ -31,6 +31,8 @@ public:
     static void taskEntry(void* arg);
     void taskLoop(void);
     size_t buildFrame(const LogEvent& event, uint8_t* out_buf, size_t out_buf_size);
+    /* seq連続性 */ 
+    void setNextSeq(uint32_t seq);
 private:
     bool makeEvent(LogEvent& event, LogLevel level, EventId event_id, const void* data, uint16_t len);
     bool makeEventFromISR(LogEvent& event, LogLevel level, EventId event_id, const void* data, uint16_t len);
@@ -40,10 +42,8 @@ private:
 	/* 連番取得関数 */
 	uint32_t nextSeq();
 	uint32_t nextSeqFromISR();
-//    size_t buildFrame(const LogEvent& event, uint8_t* out_buf, size_t out_buf_size);
     /* ログ送信関数 */
     void sendBinary(const LogEvent& event);
-
     bool sendFrame(const uint8_t* frame, uint16_t frame_len);
 private:
     QueueHandle_t queue_;

@@ -44,7 +44,12 @@ public:
     uint32_t getEndAddress() const;
     uint32_t getValidFrameCount() const;    //
     size_t   getRemainingSize() const;
-
+    uint32_t getNewestSeq() const;
+    uint32_t getCount() const;
+    // テスト用の関数
+    uint32_t getWriteAddressForTest() const;
+    // 内部データ表示
+    void printStatus(const char* title);
 private:
     FlashDriver& flash_;
     Config config_;
@@ -70,7 +75,9 @@ private:
     
     void updateIndexAfterAppend(uint32_t frame_addr, const LogFrameHeader& header);
     void invalidateFramesInErasedSector(uint32_t sector_addr);
-    
+  
+    bool isErasedAt(uint32_t) const ;
+
     // mutex
     SemaphoreHandle_t mutex_;
     bool lock(TickType_t timeout_ticks = portMAX_DELAY);

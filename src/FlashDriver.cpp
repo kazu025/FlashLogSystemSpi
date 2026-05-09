@@ -152,7 +152,7 @@ bool FlashDriver::chipErase(){
     return waitWhileBusy();
 }
 
-uint32_t FlashDriver::readJedecId(){
+uint32_t FlashDriver::readJedecId(uint8_t* out){
     uint8_t cmd = CMD_JEDEC_ID;
     uint8_t id[3] = {0};
 
@@ -160,7 +160,9 @@ uint32_t FlashDriver::readJedecId(){
     spi_write_blocking(spi_, &cmd, 1);
     spi_read_blocking(spi_, 0x00, id, sizeof(id));
     csDeselect();
-
+    if(out!=nullptr){
+        for(int i=0; i<3; i++) out[i] = id[i];
+    }
     return  (static_cast<uint32_t>(id[0]) << 16) |
             (static_cast<uint32_t>(id[1]) << 8)  |
             (static_cast<uint32_t>(id[2]));

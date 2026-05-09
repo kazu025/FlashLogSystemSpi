@@ -25,3 +25,4 @@ bool test_flash_storage_restore_with_log_frame(FlashLogStorage& storage, EventLo
 bool test_flash_storage_restore_with_multi_log_frame(FlashLogStorage& storage, EventLogger& logger);
 bool test_flash_storage_restore_after_wrap(FlashLogStorage& storage, EventLogger& logger);
 bool test_flash_storage_dump_oldest_first(FlashLogStorage& storage);
+void test_pseudo_power_cut(FlashDriver& flash);

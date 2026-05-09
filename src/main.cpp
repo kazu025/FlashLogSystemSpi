@@ -13,6 +13,10 @@
 #include "check.h"
 #include "AppTasks.h"
 
+/* CMakeListsLists.txtで切り替える
+#define RUN_NORMAL_APP            1
+#define RUN_PSEUDO_POWER_CUT_TEST 0
+*/
 static FlashDriver* g_flash_driver = nullptr;
 static FlashLogStorage* g_log_storage = nullptr;
 static UartDma* g_uart_dma = nullptr;
@@ -25,7 +29,7 @@ static constexpr uint32_t LOG_START_ADDR = 0x00001000;
 static constexpr uint32_t LOG_END_ADDR = 0x00003000;
 static void app_task(void *arg);
 static AppContext app_ctx;
-
+#if RUN_NORMAL_APP
 int main(){
     stdio_init_all();
     sleep_ms(2000);
@@ -52,19 +56,16 @@ int main(){
         while(true) { tight_loop_contents(); }
     }
     g_log_storage = &storage;
-    /* テスト段階では、起動時にログ領域を消す */
-//    printf("erase log area ... \r\n");
-    if(!storage.eraseLogArea()){
-        printf("!!! storage.eraseLogArea() failed\r\n");
-        while(true) tight_loop_contents();
-    }
-    printf("erase done\r\n");
     /* === EventLooger === */
     static EventLogger logger(uart_dma, &storage);
     if(!logger.init(32)){
         printf("!!! logger.init() failed\n");
         while(true) tight_loop_contents();
-    } 
+    }
+    if(storage.getCount()>0){
+        logger.setNextSeq(storage.getNewestSeq() + 1);
+        printf("logger seq restored to %lu\r\n", static_cast<unsigned long>(storage.getNewestSeq()+1));
+    }
     g_logger = &logger;
 
     /* === logger task === */
@@ -83,6 +84,7 @@ int main(){
     }
     app_ctx.storage = &storage;
     app_ctx.uart = &uart_dma;
+    app_ctx.logger = &logger;
     ok = xTaskCreate(command_task, "cmd", 512, &app_ctx, 1, nullptr);
     if(ok != pdPASS){
         printf("!!! xTaskCreate(command_task) failed\n");
@@ -108,3 +110,19 @@ static void app_task(void *arg){
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
+#elif RUN_PSEUDO_POWER_CUT_TEST
+int main(){
+    stdio_init_all();
+    sleep_ms(5000);
+    printf("start pseudo power cut test\n");
+    static FlashDriver flash(spi0, FlashDriver::PIN_SPI_CS,FlashDriver::PIN_SPI_SCK, FlashDriver::PIN_SPI_MOSI, FlashDriver::PIN_SPI_MISO, FlashDriver::SPI_BAUDRATE_10M);
+    flash.init();
+    uint8_t id[3];
+    flash.readJedecId(id);
+    printf("JEDEC ID: %02X %02X %02X\n", id[0], id[1], id[2]);
+    test_pseudo_power_cut(flash);
+    while(true) sleep_ms(1000);
+}
+#else
+#error "Select one main module"
+#endif

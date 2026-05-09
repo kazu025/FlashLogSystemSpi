@@ -9,21 +9,23 @@ set(CMAKE_CXX_STANDARD 17)
 pico_sdk_init()
 
 include(FreeRTOS_Kernel_import.cmake)
-
 add_executable(${PROJECT_NAME}
-    src/main.cpp
-    src/EventLogger.cpp
-    src/led25.c
-    src/freertos_hooks.c
-    src/LogEvent.cpp
-    src/UartDma.cpp
-    src/FlashLogStorage.cpp
-    src/FlashDriver.cpp
-    src/Crc32.cpp
-    src/DebugUtils.cpp
-    src/task_command.cpp
-    check/check.cpp
+src/main.cpp
+src/EventLogger.cpp
+src/led25.c
+src/freertos_hooks.c
+src/LogEvent.cpp
+src/UartDma.cpp
+src/FlashLogStorage.cpp
+src/FlashDriver.cpp
+src/Crc32.cpp
+src/DebugUtils.cpp
+src/task_command.cpp
+check/check.cpp
 )
+
+target_compile_definitions(${PROJECT_NAME} PRIVATE RUN_NORMAL_APP=1)
+target_compile_definitions(${PROJECT_NAME} PRIVATE RUN_PSEUDO_POWER_CUT_TEST=0)
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/include

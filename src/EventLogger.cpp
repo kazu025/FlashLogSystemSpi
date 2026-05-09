@@ -334,3 +334,8 @@ void EventLogger::sendStats(){
         sizeof(stats));
 }  
 
+void EventLogger::setNextSeq(uint32_t seq){
+    taskENTER_CRITICAL();
+    seq_ = seq;
+    taskEXIT_CRITICAL();
+}

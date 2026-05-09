@@ -257,6 +257,16 @@ bool FlashLogStorage::rebuildIndexFromFlash(){
 
         write_addr_ = newest_next_addr;
         valid_frame_count_ = count;
+    // write_addr_ の位置が汚れている場合は、次の sector へ逃がす
+    if(!isErasedAt(write_addr_)){
+        uint32_t safe_addr = nextSectorAddress(write_addr_);
+        write_addr_ = wrapAddress(safe_addr);
+
+#ifdef DEBUG_FlashLogStorage
+        printf("rebuildIndex: dirty tail detected, move write_addr to 0x%08X\n",
+               write_addr_);
+#endif
+        }
     }else{
         oldest_addr_ = config_.start_addr;
 
@@ -264,6 +274,15 @@ bool FlashLogStorage::rebuildIndexFromFlash(){
         newest_seq_ = 0;
         write_addr_ = config_.start_addr;
         valid_frame_count_ = 0;
+    if(!isErasedAt(write_addr_)){
+        uint32_t safe_addr = nextSectorAddress(write_addr_);
+        write_addr_ = wrapAddress(safe_addr);
+
+#ifdef DEBUG_FlashLogStorage
+        printf("rebuildIndex: dirty start detected, move write_addr to 0x%08X\n",
+               write_addr_);
+#endif
+        }
     }
 #ifdef DEBUG_FlashLogStorage
     printf("rebuildIndex: found=%d count=%u oldest=0x%08X newest=0x%08X newest_seq=%u write=0x%08X\n",
@@ -755,3 +774,39 @@ bool FlashLogStorage::sendLatestFrames(UartDma& uart, uint32_t count){
     return true;
 }
 
+uint32_t FlashLogStorage::getNewestSeq() const {
+    return newest_seq_;
+}
+
+uint32_t FlashLogStorage::getCount() const {
+    return valid_frame_count_;
+}
+
+uint32_t FlashLogStorage::getWriteAddressForTest() const {
+    return write_addr_;
+}
+
+bool FlashLogStorage::isErasedAt(uint32_t addr) const {
+    if(addr < config_.start_addr || addr >= config_.end_addr){
+        return false;
+    }
+    uint8_t b = 0x00;
+    if(!flash_.read(addr, &b, 1)){
+        return false;
+    }
+    return b == 0xFF;
+}
+
+void FlashLogStorage::printStatus(const char* title)
+{
+    printf("\n=== %s ===\n", title);
+    printf("start   = 0x%08lX\n", static_cast<unsigned long>(getStartAddress()));
+    printf("end     = 0x%08lX\n", static_cast<unsigned long>(getEndAddress()));
+    printf("write   = 0x%08lX\n", static_cast<unsigned long>(getWriteAddress()));
+    printf("oldest  = 0x%08lX\n", static_cast<unsigned long>(getOldestAddress()));
+    printf("newest  = 0x%08lX\n", static_cast<unsigned long>(getNewestAddress()));
+    printf("seq     = %lu\n",     static_cast<unsigned long>(getNewestSeq()));
+    printf("count   = %lu\n",     static_cast<unsigned long>(getCount()));
+    printf("remain  = %u\n",      static_cast<unsigned>(getRemainingSize()));
+    printf("==============================\n");
+}

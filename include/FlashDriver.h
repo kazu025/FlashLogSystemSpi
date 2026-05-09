@@ -31,7 +31,7 @@ public:
 
     bool chipErase();
 
-    uint32_t readJedecId();
+    uint32_t readJedecId(uint8_t *out=nullptr);
     uint32_t capacity() const;
 private:
     static constexpr int8_t CMD_READ_DATA       = 0x03;
