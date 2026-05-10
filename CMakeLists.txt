@@ -6,9 +6,13 @@ project(event_logger C CXX ASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
+# 疑似電源断テストを有効にするか
+option(RUN_PSEUDO_POWER_CUT_TEST "Run pseudo power cut test" OFF)
+
 pico_sdk_init()
 
 include(FreeRTOS_Kernel_import.cmake)
+
 add_executable(${PROJECT_NAME}
 src/main.cpp
 src/EventLogger.cpp
@@ -24,13 +28,23 @@ src/task_command.cpp
 check/check.cpp
 )
 
-target_compile_definitions(${PROJECT_NAME} PRIVATE RUN_NORMAL_APP=1)
-target_compile_definitions(${PROJECT_NAME} PRIVATE RUN_PSEUDO_POWER_CUT_TEST=0)
-
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/include
     ${CMAKE_CURRENT_LIST_DIR}/check
 )
+
+# Cmake optionをcomplie definitionに変換する
+if(RUN_PSEUDO_POWER_CUT_TEST)
+    message(STATUS "Build mode: PSEUDO POWER CUT TEST")
+    target_compile_definitions(${PROJECT_NAME} PRIVATE
+        RUN_NORMAL_APP=0
+        RUN_PSEUDO_POWER_CUT_TEST=1)
+else ()
+    message(STATUS "Build mode: NORMAL APP")
+    target_compile_definitions(${PROJECT_NAME} PRIVATE
+        RUN_NORMAL_APP=1
+        RUN_PSEUDO_POWER_CUT_TEST=0)
+endif()
 
 target_link_libraries(${PROJECT_NAME}
     pico_stdlib
