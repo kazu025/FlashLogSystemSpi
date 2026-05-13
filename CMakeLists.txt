@@ -23,9 +23,10 @@ src/UartDma.cpp
 src/FlashLogStorage.cpp
 src/FlashDriver.cpp
 src/Crc32.cpp
-src/DebugUtils.cpp
+src/utility.cpp
+src/AdcLoggerTask.cpp
 src/task_command.cpp
-check/check.cpp
+# check/check.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE
@@ -56,6 +57,7 @@ target_link_libraries(${PROJECT_NAME}
     hardware_irq
 	hardware_gpio
     hardware_spi
+    hardware_adc
 )
 if (PICO_CYW43_SUPPORTED)
     target_link_libraries(${PROJECT_NAME} pico_cyw43_arch_none)

@@ -7,7 +7,7 @@
 #include "FlashDriver.h"
 #include "FlashLogStorage.h"
 #include "led25.h"
-#include "DebugUtils.h"
+#include "utility.h"
 #include <cstring>
 
 bool test_flash_basic_rw(FlashDriver& flash);

@@ -1,536 +1,433 @@
-# FlashLogNUartOut
+# Raspberry Pi Pico ADC Logger
 
-Raspberry Pi Pico / RP2040 上で動作する、FreeRTOS + UART DMA + SPI Flash ログ保存システムです。
+Raspberry Pi PicoでADC値を取得し、ログとして保存・出力し、PC側でCSV化してPythonでグラフ化する実験プロジェクトです。
 
-ログフレームを外部 SPI Flash にリングバッファ形式で保存し、必要に応じて UART DMA 経由で PC 側へ送信します。  
-疑似電源断テストにより、ログ書き込み途中で停止した場合でも、最後の正常フレームまで復旧できることを確認しています。
+ADCの瞬時値、移動平均値、電圧換算値をログとして扱い、取得したデータを後から確認・解析できるようにすることを目的としています。
 
 ---
 
 ## 目的
 
-このプロジェクトの目的は、組込み機器向けに以下を実現することです。
-
-- 実行中のイベントログをバイナリフレームとして保存する
-- UART DMA により低負荷でログを送信する
-- SPI Flash にログを永続保存する
-- 電源断後も Flash 内ログから復旧できる
-- 書きかけログフレームを誤って有効ログとして扱わない
-- 復旧後も安全な位置からログ追記を再開する
-
----
-
-## 主な機能
-
-- FreeRTOS タスクベースのログ処理
-- UART DMA によるバイナリログ送信
-- 外部 SPI Flash へのログ保存
-- Flash 上のリングバッファ管理
-- CRC32 によるログフレーム検証
-- 古い順のログ読み出し
-- 最新 N 件のログ送信
-- 疑似電源断復旧テスト
-- dirty tail 検出と次 sector への退避
-
----
-
-## ハードウェア構成
-
-### 使用ボード
-
-- Raspberry Pi Pico
-- RP2040
-
-### 外部 SPI Flash
-
-例：
-
-- W25Q32 系 SPI Flash
-- 確認済み JEDEC ID: `EF 40 16`
-
-### SPI Flash 接続例
-
-| 信号 | GPIO |
-| ---- | --- :|
-| MISO | GPIO16 |
-| CS   | GPIO17 |
-| SCK  | GPIO18 |
-| MOSI | GPIO19 |
-
----
-
-## ソフトウェア構成
-
-主な構成は以下の通りです。
+このプロジェクトの目的は、Raspberry Pi Picoを使って、以下の一連の流れを確認することです。
 
 ```text
-src/
-├── main.cpp
-├── EventLogger.cpp
-├── FlashLogStorage.cpp
-├── FlashDriver.cpp
-├── UartDma.cpp
-├── Crc32.cpp
-├── LogEvent.cpp
-├── DebugUtils.cpp
-├── task_command.cpp
-├── led25.c
-└── freertos_hooks.c
-
-include/
-├── EventLogger.h
-├── FlashLogStorage.h
-├── FlashDriver.h
-├── UartDma.h
-├── Crc32.h
-├── LogTypes.h
-├── LogProtocol.h
-├── EventId.h
-└── DebugUtils.h
-```
-
----
-
-## ログ保存の流れ
-
-通常動作時の大まかな流れは以下です。
-
-```text
-Application
-   ↓
-EventLogger
-   ↓
-LogProtocol / buildFrame()
-   ↓
-FlashLogStorage
-   ↓
-FlashDriver
-   ↓
-External SPI Flash
-```
-
-Flash に保存されたログは、後で古い順または最新 N 件として UART DMA 経由で PC 側へ送信できます。
-
-```text
-SPI Flash
-   ↓
-FlashLogStorage
-   ↓
-UartDma
-   ↓
-PC logger_viewer.py
-```
-
----
-
-## ログフレーム形式
-
-ログはバイナリフレームとして保存・送信されます。
-
-```text
-Magic      : 2 bytes
-Header     : 12 bytes
-Payload    : 0〜64 bytes
-CRC32      : 4 bytes
-```
-
-### Magic
-
-```text
-0xA5 0x5A
-```
-
-### Header
-
-```cpp
-struct LogFrameHeader {
-    uint32_t seq;
-    uint16_t event_id;
-    uint8_t  level;
-    uint8_t  length;
-    uint32_t timestamp_us;
-};
-```
-
-### CRC32
-
-CRC32 は以下を対象に計算します。
-
-```text
-Magic + Header + Payload
-```
-
-CRC の対象に CRC32 自身は含めません。
-
----
-
-## FlashLogStorage の特徴
-
-`FlashLogStorage` は SPI Flash 上にログフレームを保存するためのクラスです。
-
-主な特徴は以下です。
-
-- Flash 領域を sector 単位で管理
-- 書き込み位置 `write_addr_` を保持
-- 最古フレーム `oldest_addr_` を保持
-- 最新フレーム `newest_addr_` と `newest_seq_` を保持
-- 有効フレーム数 `valid_frame_count_` を保持
-- フレームの妥当性を magic / length / CRC32 で確認
-- 起動時に Flash 全体をスキャンして index を再構築
-
----
-
-## Flash 書き込み方針
-
-### sector を跨ぐフレームは書かない
-
-1つのログフレームが sector 境界を跨ぎそうな場合は、次の sector 先頭へ移動します。
-
-```text
-sector A
-[ frame ][ frame ][ 残りが足りない ]
-
-↓ 次の sector へ移動
-
-sector B
-[ new frame ]
-```
-
-### page 境界は分割して書く
-
-SPI Flash の page program は 256 byte 境界を跨げないため、必要に応じて page 単位に分割して書き込みます。
-
-### sector 先頭に書く前に erase する
-
-書き込み位置が sector 先頭の場合、その sector を erase してから書き込みます。
-
----
-
-## 電源断復旧の考え方
-
-電源断が発生すると、Flash 上に以下のような状態が残る可能性があります。
-
-```text
-[正常 frame0][正常 frame1][正常 frame2][書きかけ frame3...]
-```
-
-書きかけフレームは CRC32 が一致しない、または header が不正になるため、有効フレームとして扱いません。
-
-起動時には `rebuildIndexFromFlash()` により Flash をスキャンし、有効なフレームだけを index に登録します。
-
----
-
-## dirty tail 対策
-
-書きかけフレームがある場合、最後の正常フレームの直後には不完全なデータが残っています。
-
-例：
-
-```text
-0x00001000: 正常 frame0
-0x00001021: 正常 frame1
-0x00001042: 正常 frame2
-0x00001063: 正常 frame3
-0x00001084: 正常 frame4
-0x000010A5: 書きかけ frame5
-```
-
-この場合、単純に `write_addr_ = 0x000010A5` として再開すると危険です。
-
-Flash は erase しない限り、0 にした bit を 1 に戻せないためです。
-
-そのため、復旧時に `write_addr_` が汚れている場合は、次の sector 先頭へ退避します。
-
-```text
-dirty tail detected
+ADC入力を取得
 ↓
-write_addr_ = next sector start
-```
-
-例：
-
-```text
-write_addr_ = 0x000010A5
+ADC raw値をログ化
 ↓
-write_addr_ = 0x00002000
+移動平均を計算
+↓
+電圧値に変換
+↓
+ログをCSVとして保存
+↓
+Pythonでグラフ化
+```
+
+単にADC値を表示するだけでなく、ログデータとして保存し、あとからグラフで確認できる構成を目指しています。
+
+---
+
+## 現在できていること
+
+現在、以下の内容を確認済みです。
+
+- Raspberry Pi PicoでADC値を取得
+- ADC raw値をログ出力
+- 16点移動平均値を計算
+- ADC値を電圧に変換
+- ログをCSV形式で保存
+- Pythonスクリプトでグラフを自動生成
+- CRC OKの行だけを対象にしてグラフ化
+- ADC raw値、移動平均、電圧、ヒストグラムをPNG出力
+
+---
+
+## システム構成
+
+```text
+Raspberry Pi Pico
+  |
+  | ADC入力
+  v
+ADC取得タスク
+  |
+  | raw値 / moving average / voltage
+  v
+ログ出力
+  |
+  | UART / Flash / Viewerなど
+  v
+CSVファイル
+  |
+  | plot_adc_log.py
+  v
+PNGグラフ
 ```
 
 ---
 
-## 疑似電源断テスト
+## データの流れ
 
-### テスト内容
+### 1. Pico側
 
-疑似電源断テストでは、以下を確認します。
+Pico側では、ADC値を読み取り、以下のような情報をログとして出力します。
 
-1. 正常ログを 5 個保存する
-2. 次のログフレームを先頭 8 byte だけ Flash に直接書く
-3. 再起動相当として `FlashLogStorage` を再初期化する
-4. 書きかけフレームを無効として扱う
-5. `write_addr_` を次の sector へ退避する
-6. 復旧後にログ追記できることを確認する
-7. 古い順に読み出せることを確認する
-8. UART DMA で送信し、PC 側 viewer で CRC OK を確認する
+```text
+ADC raw=1115 avg=1112 voltage=0.896
+```
+
+主な値は以下です。
+
+| 項目 | 内容 |
+|---|---|
+| `adc_raw` | ADCの瞬時値 |
+| `adc_avg` | 移動平均後のADC値 |
+| `adc_voltage` | ADC平均値を電圧換算した値 |
 
 ---
 
-## 疑似電源断テストの確認結果
+### 2. PC側
 
-確認例：
+PC側では、ログをCSVとして保存します。
 
-```text
-=== storage ===
-start   = 0x00001000
-end     = 0x00003000
-write   = 0x000010A5
-oldest  = 0x00001000
-newest  = 0x00001084
-seq     = 4
-count   = 5
-remain  = 8027
-```
+CSVには以下のような列が含まれます。
 
-この時点で、`seq=0` から `seq=4` までの 5 フレームが保存されています。
-
-その後、`seq=5` 相当のフレームを先頭 8 byte だけ書き込み、疑似電源断状態を作ります。
-
-```text
-pseudo power cut addr=0x000010A5
-full frame len=49
-write only first 8 bytes
-```
-
-復旧後：
-
-```text
-=== restored ===
-start   = 0x00001000
-end     = 0x00003000
-write   = 0x00002000
-oldest  = 0x00001000
-newest  = 0x00001084
-seq     = 4
-count   = 5
-remain  = 4096
-```
-
-ポイントは以下です。
-
-```text
-seq     = 4
-count   = 5
-write   = 0x00002000
-```
-
-つまり、
-
-- 書きかけ `seq=5` は無効扱い
-- 正常な `seq=0〜4` は復旧
-- 汚れた `0x000010A5` は避ける
-- 次 sector の `0x00002000` へ退避
-
-できています。
-
-復旧後にさらに 3 フレーム追加すると、以下のようになります。
-
-```text
-=== after append following restore ===
-start   = 0x00001000
-end     = 0x00003000
-write   = 0x00002075
-oldest  = 0x00001000
-newest  = 0x0000204E
-seq     = 7
-count   = 8
-remain  = 3979
-```
-
-これにより、
-
-```text
-seq=0〜4 : 電源断前の正常ログ
-seq=5〜7 : 復旧後に追記したログ
-```
-
-として保存できていることが確認できます。
+| 列名 | 内容 |
+|---|---|
+| `pc_time` | PC側で受信した時刻 |
+| `seq` | ログのシーケンス番号 |
+| `event_id` | イベントID |
+| `event_name` | イベント名 |
+| `level_name` | ログレベル名 |
+| `timestamp_us` | Pico側のタイムスタンプ |
+| `payload_text` | ログ本文 |
+| `adc_raw` | ADC raw値 |
+| `adc_avg` | ADC移動平均値 |
+| `adc_voltage` | 電圧値 |
+| `crc_ok` | CRCチェック結果 |
 
 ---
 
-## UART 送信確認
+## グラフ作成スクリプト
 
-Flash から読み出したログを UART DMA 経由で PC へ送信し、`logger_viewer.py` で受信します。
+ADCログCSVをグラフ化するために、`plot_adc_log.py` を使用します。
 
-確認例：
+### 必要なPythonライブラリ
 
-```text
-seq=0 INFO TEXT_LOG msg="normal frame 0" crc=OK
-seq=1 INFO TEXT_LOG msg="normal frame 1" crc=OK
-seq=2 INFO TEXT_LOG msg="normal frame 2" crc=OK
-seq=3 INFO TEXT_LOG msg="normal frame 3" crc=OK
-seq=4 INFO TEXT_LOG msg="normal frame 4" crc=OK
-seq=5 INFO TEXT_LOG msg="after restore frame 5" crc=OK
-seq=6 INFO TEXT_LOG msg="after restore frame 6" crc=OK
-seq=7 INFO TEXT_LOG msg="after restore frame 7" crc=OK
-```
-
-すべて `crc=OK` になっているため、以下を確認できています。
-
-- Flash 内のフレームが壊れていない
-- Flash から正しく読み出せている
-- UART DMA で送信できている
-- PC 側 viewer で正しく復号できている
-
----
-
-## ビルド方法
-
-### 環境変数
-
-`PICO_SDK_PATH` を設定しておきます。
-
-例：
+以下のライブラリを使用します。
 
 ```bash
-export PICO_SDK_PATH=/home/user/pico/pico-sdk
+pip install pandas matplotlib
 ```
 
-### ビルド
+仮想環境を使う場合は、例えば以下のようにします。
 
 ```bash
-./mk.sh
+python3 -m venv .venv
+source .venv/bin/activate
+pip install pandas matplotlib
 ```
 
-### クリーンビルド
+---
+
+## 使い方
+
+### 基本実行
 
 ```bash
-./mk.sh clean
+python3 plot_adc_log.py log.csv
 ```
 
----
-
-## 実行モードの切り替え
-
-`CMakeLists.txt` で以下の compile definition を切り替えます。
-
-### 通常アプリモード
-
-```cmake
-target_compile_definitions(${PROJECT_NAME} PRIVATE RUN_NORMAL_APP=1)
-target_compile_definitions(${PROJECT_NAME} PRIVATE RUN_PSEUDO_POWER_CUT_TEST=0)
-```
-
-### 疑似電源断テストモード
-
-```cmake
-target_compile_definitions(${PROJECT_NAME} PRIVATE RUN_NORMAL_APP=0)
-target_compile_definitions(${PROJECT_NAME} PRIVATE RUN_PSEUDO_POWER_CUT_TEST=1)
-```
-
-注意点として、`target_compile_definitions()` は `add_executable()` の後に書きます。
-
-正しい順序：
-
-```cmake
-add_executable(${PROJECT_NAME}
-    src/main.cpp
-    src/EventLogger.cpp
-    src/UartDma.cpp
-    src/FlashLogStorage.cpp
-    src/FlashDriver.cpp
-    src/Crc32.cpp
-    ...
-)
-
-target_compile_definitions(${PROJECT_NAME} PRIVATE RUN_NORMAL_APP=1)
-target_compile_definitions(${PROJECT_NAME} PRIVATE RUN_PSEUDO_POWER_CUT_TEST=0)
-```
-
----
-
-## PC 側でのログ受信
-
-UART から送信されるログはバイナリフレームです。
-
-そのため、Minicom では正しく読めません。  
-確認には `logger_viewer.py` を使用します。
-
-例：
-
-```bash
-python3 logger_viewer.py --port /dev/ttyACM0 --baud 460800
-```
-
-baudrate は Pico 側の `UartDma` 設定と一致させてください。
-
----
-
-## Minicom 使用時の注意
-
-Minicom は主にコマンド入力や `printf` 確認用です。
-
-バイナリログ送信中は、表示不能文字や制御文字が混ざるため、画面上では文字化けしたように見える場合があります。
-
-バイナリログの正否は Minicom ではなく、`logger_viewer.py` の `crc=OK` で確認します。
-
----
-
-## コマンド例
-
-通常アプリモードでは、コマンドタスクからログ操作を行います。
-
-例：
+デフォルトでは、`graphs` ディレクトリにグラフ画像が出力されます。
 
 ```text
-s    : FlashLogStorage の状態表示
-p    : ログ生成停止
-r    : ログ生成再開
-a    : 全ログを古い順に UART 送信
-l10  : 最新 10 件を UART 送信
+graphs/adc_raw_avg.png
+graphs/adc_voltage.png
+graphs/adc_raw_hist.png
+graphs/adc_voltage_hist.png
 ```
 
 ---
 
-## 現在確認済みの内容
+### 出力先を指定する場合
 
-以下を確認済みです。
+```bash
+python3 plot_adc_log.py log.csv --outdir adc_graphs
+```
+
+この場合、`adc_graphs` ディレクトリにPNGファイルが出力されます。
+
+---
+
+### 画面にも表示する場合
+
+```bash
+python3 plot_adc_log.py log.csv --show
+```
+
+PNG保存に加えて、matplotlibの画面表示も行います。
+
+---
+
+### CRC NG行も含める場合
+
+通常は `crc_ok=1` の行だけをグラフ化します。
+
+CRC NG行も含めたい場合は、以下のように実行します。
+
+```bash
+python3 plot_adc_log.py log.csv --include-crc-ng
+```
+
+---
+
+## 出力されるグラフ
+
+### 1. ADC raw値と移動平均
 
 ```text
-OK: SPI Flash JEDEC ID 読み出し
-OK: Flash sector erase
-OK: Flash page program
-OK: ログフレーム append
-OK: CRC32 検証
-OK: Flash 上の有効フレーム scan
-OK: oldest / newest / count の index 再構築
-OK: 疑似電源断による書きかけフレーム検出
-OK: 書きかけフレームの無効化
-OK: dirty tail 検出
-OK: 次 sector への write_addr_ 退避
-OK: 復旧後 append
-OK: 古い順読み出し
-OK: UART DMA 送信
-OK: logger_viewer.py による CRC OK 確認
+graphs/adc_raw_avg.png
+```
+
+ADCの瞬時値と移動平均値を同じグラフに表示します。
+
+raw値は入力変化にすぐ反応しますが、移動平均値はなめらかに変化します。  
+これにより、移動平均による平滑化の効果を確認できます。
+
+---
+
+### 2. ADC電圧
+
+```text
+graphs/adc_voltage.png
+```
+
+ADC平均値を電圧換算した値を表示します。
+
+Pico側で計算した電圧値の変化を確認できます。
+
+---
+
+### 3. ADC raw値のヒストグラム
+
+```text
+graphs/adc_raw_hist.png
+```
+
+ADC raw値の分布を表示します。
+
+ADC値のばらつきやノイズ傾向を確認するために使います。
+
+---
+
+### 4. ADC電圧のヒストグラム
+
+```text
+graphs/adc_voltage_hist.png
+```
+
+電圧値の分布を表示します。
+
+入力信号の安定性や測定値の偏りを確認するために使います。
+
+---
+
+## CSVファイル例
+
+CSVの一部は以下のような形式です。
+
+```csv
+pc_time,seq,event_id,event_name,level,level_name,timestamp_us,length,payload_text,adc_raw,adc_avg,adc_voltage,crc_ok
+2026-05-12T20:14:55,0,200,TEXT_LOG,0,INFO,2084037045,35,"ADC raw=1115 avg=1112 voltage=0.896",1115,1112.0,0.896,1
+2026-05-12T20:14:55,1,200,TEXT_LOG,0,INFO,2085036998,35,"ADC raw=1118 avg=1112 voltage=0.896",1118,1112.0,0.896,1
 ```
 
 ---
 
-## 今後の改善候補
+## plot_adc_log.py の仕様
 
-今後の改善候補は以下です。
+`plot_adc_log.py` は、以下の列を使用します。
 
-- テスト用 main と通常 main の切り替えをさらに整理する
-- CMake option でテストモードを選択できるようにする
-- `DEBUG_FlashLogStorage` の出力を整理する
-- `invalid length=255` などの debug 出力を release 時には抑制する
-- Flash log 領域を設定ファイル化する
-- 電源断テストのパターンを増やす
-  - magic だけ書いた場合
-  - header 途中で止まった場合
-  - payload 途中で止まった場合
-  - CRC 途中で止まった場合
-  - sector 境界付近で止まった場合
-- README に実測ログを追加する
-- GitHub Actions で host 側ユニットテストを追加する
+| 列名 | 必須 | 用途 |
+|---|---:|---|
+| `adc_raw` | 必須 | ADC raw値のグラフとヒストグラム |
+| `adc_avg` | 任意 | 移動平均グラフ |
+| `adc_voltage` | 任意 | 電圧グラフとヒストグラム |
+| `timestamp_us` | 任意 | 横軸を経過秒に変換 |
+| `seq` | 任意 | `timestamp_us` がない場合の横軸 |
+| `crc_ok` | 任意 | CRC OK行の抽出 |
+
+横軸は、以下の優先順位で決まります。
+
+```text
+timestamp_us がある場合: 開始時刻からの経過秒
+timestamp_us がない場合: seq
+seq もない場合: 行番号
+```
+
+---
+
+## 実行例
+
+```bash
+python3 plot_adc_log.py log.csv
+```
+
+実行すると、以下のようなサマリが表示されます。
+
+```text
+=== ADC log summary ===
+all rows  : 31
+plot rows : 31
+crc OK    : 31
+crc NG    : 0
+adc_raw    : min=114.000, max=4095.000, mean=2515.516
+adc_avg    : min=1112.000, max=2732.000, mean=2173.903
+adc_voltage: min=0.896, max=2.202, mean=1.751
+=======================
+```
+
+---
+
+## 確認ポイント
+
+グラフを見るときは、以下を確認します。
+
+### ADC raw値
+
+- 急激な変化があるか
+- 4095付近に張り付いていないか
+- 0付近に張り付いていないか
+- ノイズが大きすぎないか
+
+### 移動平均値
+
+- raw値に対してなめらかに追従しているか
+- 反応が遅れすぎていないか
+- 平滑化の効果が出ているか
+
+### 電圧値
+
+- 想定した範囲の電圧になっているか
+- 入力変化に対して自然に変化しているか
+- 上限・下限に張り付いていないか
+
+### ヒストグラム
+
+- 値がどの範囲に集中しているか
+- ノイズのばらつきがどの程度あるか
+- 外れ値がないか
+
+---
+
+## 注意点
+
+### ADC入力電圧について
+
+Raspberry Pi PicoのADC入力は、通常0Vから3.3Vの範囲で扱います。  
+3.3Vを超える電圧を直接入力しないように注意してください。
+
+### ADC値の上限
+
+12bit ADCの場合、ADC raw値は以下の範囲になります。
+
+```text
+0 ～ 4095
+```
+
+`adc_raw=4095` が頻繁に出る場合、入力電圧が上限付近に達している可能性があります。
+
+### 移動平均について
+
+移動平均を大きくすると、ノイズは減りますが、変化への追従は遅くなります。
+
+今回の例では、16点移動平均を想定しています。
+
+---
+
+## 今後の拡張案
+
+今後、以下のような拡張が考えられます。
+
+- CSVファイル名を自動で日付付きにする
+- 複数CSVをまとめて比較する
+- ADC raw値と電圧値を同じ図に表示する
+- 平均値、最大値、最小値をCSVに追記する
+- グラフにしきい値ラインを表示する
+- 異常値を検出する
+- 長時間ログの分割保存に対応する
+- Flashログから読み出したデータを直接グラフ化する
+- Note記事やREADME用にグラフ画像を自動コピーする
+
+---
+
+## ディレクトリ構成例
+
+```text
+.
+├── README.md
+├── plot_adc_log.py
+├── log.csv
+└── graphs/
+    ├── adc_raw_avg.png
+    ├── adc_voltage.png
+    ├── adc_raw_hist.png
+    └── adc_voltage_hist.png
+```
+
+Pico側のソースコードも含める場合は、以下のような構成にできます。
+
+```text
+.
+.
+├── CMakeLists.txt
+├── FreeRTOS-Kernel
+├── LICENSE
+├── README.md
+├── check
+│   ├── check.cpp
+│   └── check.h
+├── debug
+│   ├── adc_log.csv
+│   ├── graphs
+│   ├── logger_stas
+│   ├── logger_viewer.py
+│   └── plot_adc_log.py
+├── include
+│   ├── AdcLoggerTask.h
+│   ├── CommandTask.h
+│   ├── Crc32.h
+│   ├── EventId.h
+│   ├── EventLogger.h
+│   ├── FlashDriver.h
+│   ├── FlashLogStorage.h
+│   ├── FreeRTOSConfig.h
+│   ├── LogPayloads.h
+│   ├── LogProtocol.h
+│   ├── LogTypes.h
+│   ├── UartDma.h
+│   ├── freertos_hooks.h
+│   ├── led25.h
+│   └── utility.h
+├── ld.sh
+├── mk.sh
+└── src
+    ├── AdcLoggerTask.cpp
+    ├── Crc32.cpp
+    ├── EventLogger.cpp
+    ├── FlashDriver.cpp
+    ├── FlashLogStorage.cpp
+    ├── LogEvent.cpp
+    ├── UartDma.cpp
+    ├── freertos_hooks.c
+    ├── led25.c
+    ├── main.cpp
+    ├── task_command.cpp
+    └── utility.cpp
+
+
+```
 
 ---
 
@@ -538,14 +435,12 @@ OK: logger_viewer.py による CRC OK 確認
 
 MIT License
 
-Pico SDK、FreeRTOS、その他外部ライブラリを使用する場合は、それぞれのライセンスに従ってください。
+Pico SDK、FreeRTOS、その他外部ライブラリを使用している場合は、それぞれのライセンスにも従ってください。
 
 ---
 
-## まとめ
+## メモ
 
-このプロジェクトでは、Raspberry Pi Pico 上で FreeRTOS、UART DMA、外部 SPI Flash を組み合わせ、電源断に強いログ保存システムを構築しています。
+このプロジェクトは、Raspberry Pi Picoを使ったADC測定、ログ保存、CSV解析、Pythonグラフ化の基本的な流れを確認するためのものです。
 
-疑似電源断テストにより、書きかけフレームを無効として扱い、最後の正常フレームまで復旧し、さらに安全な sector からログ追記を再開できることを確認しました。
-
-また、復旧後のログを UART DMA で送信し、PC 側 viewer で全フレーム `crc=OK` として確認できています。
+組込みソフトウェアのログ設計、データ可視化、実験記録の自動化の練習として利用できます。

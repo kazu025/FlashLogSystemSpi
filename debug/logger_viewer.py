@@ -18,6 +18,9 @@ Features:
 >python logger_viewer.py --port /dev/ttyUSB0 --baud 115200
 ----
 >python logger_viewer.py --port /dev/ttyUSB0 --baud 115200 --csv log.csv
+----
+>python logger_viewer.py --port /dev/ttyUSB0 --baud 460800 --csv adc_log.csv
+>python logger_viewer.py --port /dev/ttyUSB0 --baud 460800 --csv adc_log.csv --quiet
 ---- 
 read binary file
 >python logger_viewer.py --file captured.bin
@@ -35,6 +38,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Optional
+import re
 
 try:
     import serial  # pyserial
@@ -152,7 +156,7 @@ def u32le(b: bytes) -> int:
     return int.from_bytes(b, "little", signed=False)
 
 def color(s, c):
-    return f"\033[{c}m{s}\033[0/m"
+    return f"\033[{c}m{s}\033[0m"
 
 def calc_crc(seq: int, event_id: int, level: int, length: int, timestamp_us: int, payload: bytes) -> int:
     buf = bytearray()
@@ -282,6 +286,20 @@ def payload_to_text(frame: LogFrame) -> str:
 
     return " ".join(f"{b:02x}" for b in frame.payload)
 
+ADC_RE = re.compile(
+    r"ADC\s+raw=(?P<raw>\d+)\s+avg=(?P<avg>[0-9.]+)\s+voltage=(?P<voltage>[0-9.]+)"
+)
+def parse_adc_text(text: str):
+    m = ADC_RE.search(text)
+    if not m:
+        return None
+
+    return {
+        "adc_raw": int(m.group("raw")),
+        "adc_avg": float(m.group("avg")),
+        "adc_voltage": float(m.group("voltage")),
+    }
+
 def level_name(level: int) -> str:
     return LEVEL_NAMES.get(level, f"LV{level}")
 
@@ -357,6 +375,9 @@ def open_csv(path: Optional[str]):
         "length",
         "payload_hex",
         "payload_text",
+        "adc_raw",
+        "adc_avg",
+        "adc_voltage",
         "crc_rx",
         "crc_calc",
         "crc_ok",
@@ -382,6 +403,17 @@ def write_csv(writer, frame: LogFrame) -> None:
         payload_text = csv_safe_text(payload_to_text(frame))
     else:
         payload_text = "<CRC_NG>"
+    
+    adc_raw =""
+    adc_avg =""
+    adc_voltage =""
+
+    if frame.crc_ok:
+        adc = parse_adc_text(payload_text)
+        if adc is not None:
+            adc_raw = adc["adc_raw"]
+            adc_avg = adc["adc_avg"]
+            adc_voltage = adc["adc_voltage"]
 
     writer.writerow([
         time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -394,6 +426,9 @@ def write_csv(writer, frame: LogFrame) -> None:
         frame.length,
         payload_hex,
         payload_text,
+        adc_raw,
+        adc_avg,
+        adc_voltage,
         f"0x{frame.crc_rx:08X}",
         f"0x{frame.crc_calc:08X}",
         int(frame.crc_ok),
@@ -462,6 +497,9 @@ def main() -> int:
                 seq_note = "crc_ng"
 
             write_csv(csv_writer, frame)
+
+            if csv_fp is not None:
+                csv_fp.flush()
 
             if not args.quiet:
                 print(format_line(frame, stats, stats.ok, stats.crc_ng, seq_ok, seq_note), flush=True)

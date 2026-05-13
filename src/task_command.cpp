@@ -1,18 +1,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "AppTasks.h"
+#include <atomic>
+#include "CommandTask.h"
 
-static volatile bool g_log_paused = true;
+static std::atomic<bool> g_log_paused{true};
 
 bool isLogPaused(){
-    return g_log_paused;
+    return g_log_paused.load(std::memory_order_relaxed);
 }
 void pauseLogGeneration(){
-    g_log_paused = true;
+    g_log_paused.store(true, std::memory_order_relaxed);
 }
 void resumeLogGeneration(){
-    g_log_paused = false;
+    g_log_paused.store(false, std::memory_order_relaxed);
 }
 static void printHelp(){
     printf("\n");

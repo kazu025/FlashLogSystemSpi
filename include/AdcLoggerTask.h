@@ -7,17 +7,10 @@
 #include "pico/stdlib.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include "EventId.h"
 #include "FlashLogStorage.h"
 #include "EventLogger.h"
-struct AppContext {
-    FlashLogStorage* storage;
-    UartDma* uart;
-    EventLogger* logger;
-};
-void command_task(void *pvParameters);
-bool isLogPaused();
-void pauseLogGeneration();
-void resumeLogGeneration();
-
+#include "LogTypes.h"
+void adc_task(void* param);
 /* ------------------------------------------------------------ */
 #endif // TASK_H
